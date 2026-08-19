@@ -2016,6 +2016,95 @@ class GPUModelRunner(
 
         return encoder_seq_lens, encoder_seq_lens_cpu
 
+    # begin of soft thinking
+    def _apply_soft_thinking_embeds(self, num_scheduled_tokens: int) -> None:
+        """Replace thinking rows' token embeddings with their concept tokens.
+
+        Soft Thinking feeds back a probability-weighted mixture of embeddings
+        rather than one token's embedding while the model is reasoning. The
+        sampler computed that mixture on the previous step; here it is written
+        into ``inputs_embeds`` at each row's scheduled position and the position
+        is marked as not a token id, so the embedding pass leaves it alone --
+        the contract prompt embeds already defines for precomputed positions.
+
+        A no-op unless a request asked for soft_thinking and has taken a step.
+        """
+        self._soft_thinking_wrote_embeds = False
+        holder = getattr(self.input_batch, "soft_thinking_state_holder", None)
+        if holder is None:
+            return
+        # Tell the holder which rows have no real decode this step -- chunked or
+        # resumed prefills, whose sampled token the runner discards below. Their
+        # logits are mid-prompt positions, and the thinking state must not
+        # advance on those. Refreshed every step so nothing stale survives.
+        num_reqs = self.input_batch.num_reqs
+        holder.set_rows_without_a_real_decode(
+            np.nonzero(self.discard_request_mask.np[:num_reqs])[0].tolist()
+        )
+        handoff = holder.concept_tokens_for_rows()
+        if handoff is None:
+            return
+        rows, topk_ids, topk_probs = handoff
+
+        # Each row contributes one decode token; its slot is the last position
+        # of that row's scheduled range.
+        row_np = rows.cpu().numpy()
+        starts = self.query_start_loc.np[row_np]
+        positions_np = self.query_start_loc.np[row_np + 1] - 1
+        # Only rows scheduled exactly one token this step are decoding. A row
+        # recomputing its prompt after preemption still holds a concept token
+        # from before, and its last chunk position is a prompt token -- writing
+        # the mixture there would corrupt the prefill, in range or not.
+        valid = (positions_np < num_scheduled_tokens) & (positions_np == starts)
+        if not valid.all():
+            keep = torch.as_tensor(valid, device=topk_ids.device)
+            positions_np = positions_np[valid]
+            topk_ids, topk_probs = topk_ids[keep], topk_probs[keep]
+            if positions_np.size == 0:
+                return
+
+        embed_layer = self._soft_thinking_embed_layer()
+        if embed_layer is None:
+            return
+        mixture = embed_layer.weighted_forward(topk_ids, topk_probs)
+
+        positions = torch.as_tensor(
+            positions_np, device=self.inputs_embeds.gpu.device, dtype=torch.long
+        )
+        self.inputs_embeds.gpu[positions] = mixture.to(self.inputs_embeds.gpu.dtype)
+        # One branch reads the host copy of this mask, the other the device one.
+        self.is_token_ids.np[positions_np] = False
+        self.is_token_ids.copy_to_gpu(num_scheduled_tokens)
+        self._soft_thinking_wrote_embeds = True
+
+    def _soft_thinking_embed_layer(self):
+        """The model's vocab embedding, cached; None if it has no ordinary one."""
+        cached = getattr(self, "_st_embed_layer", "unset")
+        if cached != "unset":
+            return cached
+        from vllm.model_executor.layers.vocab_parallel_embedding import (
+            ParallelLMHead,
+            VocabParallelEmbedding,
+        )
+
+        # ParallelLMHead subclasses VocabParallelEmbedding, and on a model with
+        # untied weights mixing through it would use the output projection
+        # instead of the input embedding -- exclude it rather than trust
+        # modules() order to put embed_tokens first.
+        layer = next(
+            (
+                m
+                for m in self.model.modules()
+                if isinstance(m, VocabParallelEmbedding)
+                and not isinstance(m, ParallelLMHead)
+            ),
+            None,
+        )
+        self._st_embed_layer = layer
+        return layer
+
+    # end of soft thinking
+
     def _prepare_inputs(
         self,
         scheduler_output: "SchedulerOutput",
@@ -3636,6 +3725,13 @@ class GPUModelRunner(
         if self.speculative_config is not None:
             self.input_ids.gpu[:num_input_tokens].clamp_(min=0)
 
+        # begin of soft thinking
+        # Overwrite the thinking rows' inputs with their concept tokens before
+        # anything embeds them. After _prepare_inputs, which fixes the row
+        # order this reads.
+        self._apply_soft_thinking_embeds(num_scheduled_tokens)
+        # end of soft thinking
+
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         ec_connector_output = None
@@ -3652,7 +3748,12 @@ class GPUModelRunner(
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
-            if self.enable_prompt_embeds and self.input_batch.req_prompt_embeds:
+            # The else branch below copies over the whole buffer, which
+            # would erase concept tokens; this masked path is what leaves
+            # non-token-id positions alone.
+            if (
+                self.enable_prompt_embeds and self.input_batch.req_prompt_embeds
+            ) or getattr(self, "_soft_thinking_wrote_embeds", False):
                 # Some positions carry precomputed prompt_embeds: they are
                 # already in self.inputs_embeds and marked is_token_ids=False.
                 # Embed only the token-id positions (zeroing the placeholder ids

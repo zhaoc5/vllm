@@ -99,6 +99,17 @@ class Sampler(nn.Module):
         logits = self.apply_logits_processors(
             logits, sampling_metadata, predict_bonus_token
         )
+
+        # begin of soft thinking
+        # Runs here because these logits carry the penalties but not yet the
+        # temperature or the filters, which is the point the concept token and
+        # the Cold Stop entropy are both defined at.
+        soft_forced_ids: torch.Tensor | None = None
+        soft_holder = sampling_metadata.soft_thinking_state_holder
+        if soft_holder is not None and soft_holder.has_tracked_requests():
+            soft_forced_ids = soft_holder.step_from_metadata(logits, sampling_metadata)
+        # end of soft thinking
+
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
         if processed_logprobs is not None:
@@ -108,6 +119,14 @@ class Sampler(nn.Module):
         # This conversion is necessary because FlashInfer sampling operations
         # return int32 (while PyTorch argmax and topk return int64).
         sampled = sampled.long()
+
+        # begin of soft thinking
+        # Cold Stop emits </think> itself, so the trace closes even though the
+        # row never chose it. Shape-guarded: speculative decoding returns a
+        # different row count, and forcing there would misalign the draft.
+        if soft_forced_ids is not None and soft_forced_ids.shape == sampled.shape:
+            sampled = torch.where(soft_forced_ids >= 0, soft_forced_ids, sampled)
+        # end of soft thinking
 
         # Handle logprob_token_ids if specified (more efficient than full vocab)
         # This is used by generative_scoring API to get logprobs for specific tokens

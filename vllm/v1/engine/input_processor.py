@@ -128,6 +128,75 @@ class InputProcessor:
                     "not configured. Please set --reasoning-parser "
                     "and/or --reasoning-config to use thinking_token_budget."
                 )
+            # begin of soft thinking
+            if params.soft_thinking and self.vllm_config.use_v2_model_runner:
+                # Soft Thinking lives in the V1 GPU model runner (its sampler
+                # hook and inputs_embeds overlay); the V2 runner has neither and
+                # would silently decode plain CoT. Dense non-MoE models default
+                # to V2, so refuse loudly instead.
+                raise VLLMValidationError(
+                    "soft_thinking is implemented in the V1 GPU model runner "
+                    "only, and this engine selected the V2 runner. Set "
+                    "VLLM_USE_V2_MODEL_RUNNER=0 before building the engine."
+                )
+            if params.soft_thinking and (
+                self.vllm_config.reasoning_config is None
+                or not self.vllm_config.reasoning_config.enabled
+            ):
+                # Refusing beats running: without reasoning_config there is no
+                # </think> for Cold Stop to emit and no thinking block to be
+                # inside, so the request would silently decode as plain CoT
+                # while still being labelled soft_thinking.
+                raise VLLMValidationError(
+                    "soft_thinking is set but reasoning_config is not "
+                    "configured. Please set --reasoning-parser so that the "
+                    "thinking block's start and end tokens are known."
+                )
+            if params.soft_thinking and not (
+                self.vllm_config.model_config.enable_prompt_embeds
+            ):
+                # The concept token is written into inputs_embeds and its slot
+                # marked as not-a-token-id, which is the contract prompt embeds
+                # already defines. Without it the text path hands input_ids
+                # straight to the model and there is nothing to overwrite.
+                raise VLLMValidationError(
+                    "soft_thinking requires --enable-prompt-embeds: the concept "
+                    "token is fed back through inputs_embeds, which the plain "
+                    "token-id path does not build."
+                )
+            if params.soft_thinking and self.cache_config.enable_prefix_caching:
+                # Blocks are hashed by token id, but a thinking position's KV was
+                # computed from a concept token, not from the id recorded there.
+                # A later request matching those ids would be served KV that was
+                # never produced by them.
+                raise VLLMValidationError(
+                    "soft_thinking requires --no-enable-prefix-caching: the "
+                    "prefix cache is keyed by token ids, and a concept token's "
+                    "KV does not correspond to the id recorded for it."
+                )
+            if (
+                params.soft_thinking
+                and self.vllm_config.parallel_config.pipeline_parallel_size > 1
+            ):
+                # The concept token is computed where the sampler runs (the last
+                # PP rank) but must be embedded where the embedding layer lives
+                # (the first), and nothing carries it between them.
+                raise VLLMValidationError(
+                    "soft_thinking does not support pipeline parallelism: the "
+                    "concept token is produced on the last PP rank and consumed "
+                    "by the embedding layer on the first."
+                )
+            if params.soft_thinking and self.speculative_config is not None:
+                # A draft is proposed from token ids, but a thinking row's next
+                # input is a mixture with no id, so the draft and the target
+                # would disagree about what was fed. Nothing verifies this
+                # combination, so refuse it rather than let it run.
+                raise VLLMValidationError(
+                    "soft_thinking does not support speculative decoding: a "
+                    "draft is proposed from token ids, and a thinking step "
+                    "feeds back a concept token that has none."
+                )
+            # end of soft thinking
         elif isinstance(params, PoolingParams):
             supported_pooling_tasks = [
                 task for task in supported_tasks if task in POOLING_TASKS

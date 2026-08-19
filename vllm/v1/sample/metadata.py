@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
+from vllm.v1.sample.soft_thinking_state import SoftThinkingStateHolder
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
 
@@ -53,3 +54,6 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+    # Soft Thinking: tracks which rows are still inside their thinking block and
+    # carries their concept tokens to the next step.
+    soft_thinking_state_holder: SoftThinkingStateHolder | None = None

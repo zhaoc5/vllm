@@ -33,6 +33,19 @@ try:
     fi_ar_available = hasattr(flashinfer_comm, "allreduce_fusion")
 except ImportError:
     pass
+except Exception as e:
+    # An importable-but-incompatible flashinfer must leave the feature
+    # unavailable, not kill the worker. flashinfer.comm annotates with
+    # `array.array[int]`, which raises TypeError below Python 3.12, and the
+    # ImportError-only guard let that escape into WorkerProc startup -- so any
+    # tensor-parallel run died at "Engine core initialization failed" with the
+    # real cause buried in a worker log.
+    logger.warning(
+        "flashinfer.comm is installed but could not be imported (%s: %s); "
+        "flashinfer all-reduce is unavailable.",
+        type(e).__name__,
+        e,
+    )
 
 # Workspace for standalone allreduce and non-quant ar+rms fusion
 _fi_ar_workspace = None

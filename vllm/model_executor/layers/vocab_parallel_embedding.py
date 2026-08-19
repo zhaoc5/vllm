@@ -506,6 +506,65 @@ class VocabParallelEmbedding(PluggableLayer):
             return tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
 
+    # begin of soft thinking
+    def weighted_forward(
+        self, topk_ids: torch.Tensor, topk_probs: torch.Tensor
+    ) -> torch.Tensor:
+        """Embed a *concept token*: the probability-weighted mixture of k rows.
+
+        Soft Thinking (arXiv:2505.15778) does not commit to a discrete token
+        while the model is inside its thinking block. Instead of looking up one
+        row of the embedding table it feeds back ``sum_i p_i * E[id_i]`` over the
+        renormalised top-k, so the next forward sees a point between token
+        embeddings rather than on one of them.
+
+        Under tensor parallelism each rank owns a vocab shard, so an id is real
+        on exactly one rank. The mask ``forward`` uses zeroes the rows this rank
+        does not own, making the local weighted sum a partial sum of the true
+        mixture; the all-reduce completes it. Only the reduction order differs
+        from the single-rank result.
+
+        Args:
+            topk_ids: ``[num_tokens, k]`` token ids, from the sampler's top-k.
+            topk_probs: ``[num_tokens, k]`` probabilities, already renormalised
+                to sum to one across k.
+
+        Returns:
+            ``[num_tokens, hidden_size]``, in this layer's dtype.
+        """
+        num_tokens, k = topk_ids.shape
+        flat_ids = topk_ids.reshape(-1)
+        if self.tp_size > 1:
+            masked_input, input_mask = get_masked_input_and_mask(
+                flat_ids,
+                self.shard_indices.org_vocab_start_index,
+                self.shard_indices.org_vocab_end_index,
+                self.shard_indices.num_org_vocab_padding,
+                self.shard_indices.added_vocab_start_index,
+                self.shard_indices.added_vocab_end_index,
+            )
+        else:
+            masked_input, input_mask = flat_ids, None
+
+        embeds = self.quant_method.embedding(self, masked_input.long())
+        if input_mask is not None:
+            embeds.masked_fill_(input_mask.unsqueeze(-1), 0)
+
+        # Accumulate in fp32: this is a k-way sum of products, and k is large enough
+        # (10 by default) that doing it in bf16 loses more than the cast back costs.
+        mixture = (
+            embeds.view(num_tokens, k, -1).float() * topk_probs.unsqueeze(-1).float()
+        ).sum(dim=1)
+        mixture = mixture.to(embeds.dtype)
+
+        if self.tp_size > 1:
+            # Cast before reducing: the collective then runs in the same
+            # dtype forward's does.
+            return tensor_model_parallel_all_reduce(mixture)
+        return mixture
+
+    # end of soft thinking
+
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings}"
         s += f", num_embeddings_per_partition={self.num_embeddings_per_partition}"

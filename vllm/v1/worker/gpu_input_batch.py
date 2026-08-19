@@ -24,6 +24,9 @@ from vllm.v1.sample.logits_processor import (
     MoveDirectionality,
 )
 from vllm.v1.sample.metadata import SamplingMetadata
+from vllm.v1.sample.soft_thinking_state import (
+    maybe_create_soft_thinking_state_holder,
+)
 from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
@@ -115,6 +118,11 @@ class InputBatch:
             num_spec_tokens,
             device,
             PIN_MEMORY,
+        )
+        self.soft_thinking_state_holder = maybe_create_soft_thinking_state_holder(
+            reasoning_config,
+            max_num_reqs,
+            device,
         )
         self.thinking_token_budget_reqs: set[str] = set()
         self.is_pooling_model = is_pooling_model
@@ -852,6 +860,8 @@ class InputBatch:
         batch_update = self.batch_update_builder.get_and_reset(self.num_reqs)
         if self.thinking_budget_state_holder is not None and batch_update:
             self.thinking_budget_state_holder.sync_batch(batch_update)
+        if self.soft_thinking_state_holder is not None and batch_update:
+            self.soft_thinking_state_holder.sync_batch(batch_update)
         for logit_proc in self.logitsprocs.all:
             logit_proc.update_state(batch_update)
         if batch_update:
@@ -960,6 +970,7 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            soft_thinking_state_holder=self.soft_thinking_state_holder,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

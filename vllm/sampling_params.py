@@ -263,6 +263,27 @@ class SamplingParams(
     """Represents the minimum probability for a token to be considered,
     relative to the probability of the most likely token. Must be in [0, 1].
     Set to 0 to disable this."""
+    # begin of soft thinking
+    soft_thinking: bool = False
+    """Soft Thinking (arXiv:2505.15778). While the model is inside its thinking block,
+    feed back the probability-weighted mixture of the top-`soft_topk` token embeddings
+    rather than committing to a discrete token. The answer that follows `</think>` is
+    sampled normally. The other `soft_*` fields do nothing unless this is set.
+
+    Stop *token ids* are kept out of the recorded trace while a row is thinking, so
+    they cannot end it early; `stop` *strings* are matched by the detokenizer against
+    that trace and would still cut it mid-thought -- reasoning text hits strings like
+    "\n\n" constantly -- so they are refused together with this flag."""
+    soft_topk: int = 10
+    """Number of tokens kept in the concept-token mixture."""
+    soft_entropy_threshold: float = 0.01
+    """Cold Stop: the entropy, in nats, below which a step counts as
+    low-entropy. Measured on the full post-temperature distribution, never on
+    the top_k/top_p-filtered one."""
+    soft_patience: int = 256
+    """Cold Stop: consecutive low-entropy steps before `</think>` is forced. The counter
+    resets on any step above the threshold, so this counts a run, not a total."""
+    # end of soft thinking
     seed: int | None = None
     """Random seed to use for the generation."""
     stop: str | list[str] | None = None
@@ -383,6 +404,10 @@ class SamplingParams(
         top_p: float | None = 1.0,
         top_k: int = 0,
         min_p: float = 0.0,
+        soft_thinking: bool = False,
+        soft_topk: int = 10,
+        soft_entropy_threshold: float = 0.01,
+        soft_patience: int = 256,
         seed: int | None = None,
         stop: str | list[str] | None = None,
         stop_token_ids: list[int] | None = None,
@@ -446,6 +471,10 @@ class SamplingParams(
             top_p=1.0 if top_p is None else top_p,
             top_k=top_k,
             min_p=min_p,
+            soft_thinking=soft_thinking,
+            soft_topk=soft_topk,
+            soft_entropy_threshold=soft_entropy_threshold,
+            soft_patience=soft_patience,
             seed=seed,
             stop=stop,
             stop_token_ids=stop_token_ids,
@@ -536,6 +565,47 @@ class SamplingParams(
 
     def _verify_args(self) -> None:
         _verify_num_sequences(self.n, "n")
+        # begin of soft thinking
+        if self.soft_thinking:
+            if self.soft_topk < 1:
+                raise VLLMValidationError(
+                    f"soft_topk must be at least 1, got {self.soft_topk}.",
+                    parameter="soft_topk",
+                    value=self.soft_topk,
+                )
+            if self.soft_patience < 1:
+                raise VLLMValidationError(
+                    f"soft_patience must be at least 1, got {self.soft_patience}.",
+                    parameter="soft_patience",
+                    value=self.soft_patience,
+                )
+            if self.soft_entropy_threshold < 0.0:
+                raise VLLMValidationError(
+                    "soft_entropy_threshold must be non-negative, got "
+                    f"{self.soft_entropy_threshold}.",
+                    parameter="soft_entropy_threshold",
+                    value=self.soft_entropy_threshold,
+                )
+            if self.n != 1:
+                # Each sequence carries its own thinking state and its own concept
+                # token; n > 1 would need one per branch, which is not wired up.
+                raise VLLMValidationError(
+                    f"soft_thinking supports n=1 only, got n={self.n}.",
+                    parameter="n",
+                    value=self.n,
+                )
+            if self.stop:
+                # Stop token ids are kept out of the recorded trace while a row
+                # is thinking, but stop *strings* are matched by the detokenizer
+                # against that trace and would end the request mid-thought.
+                raise VLLMValidationError(
+                    "soft_thinking does not support stop strings: the "
+                    "detokenizer would match them against the thinking trace "
+                    "and cut the request off mid-thought. Use stop_token_ids.",
+                    parameter="stop",
+                    value=self.stop,
+                )
+        # end of soft thinking
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
@@ -1142,6 +1212,10 @@ class SamplingParams(
             f"top_p={self.top_p}, "
             f"top_k={self.top_k}, "
             f"min_p={self.min_p}, "
+            f"soft_thinking={self.soft_thinking}, "
+            f"soft_topk={self.soft_topk}, "
+            f"soft_entropy_threshold={self.soft_entropy_threshold}, "
+            f"soft_patience={self.soft_patience}, "
             f"seed={self.seed}, "
             f"stop={self.stop}, "
             f"stop_token_ids={self.stop_token_ids}, "
