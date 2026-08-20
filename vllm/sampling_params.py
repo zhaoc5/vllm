@@ -284,6 +284,58 @@ class SamplingParams(
     """Cold Stop: consecutive low-entropy steps before `</think>` is forced. The counter
     resets on any step above the threshold, so this counts a run, not a total."""
     # end of soft thinking
+    # begin of swir
+    swir: bool = False
+    """SwiReasoning (the swir method): switch each row between soft feedback (the
+    full-vocabulary probability-weighted embedding mixture) and ordinary discrete
+    feedback on the entropy trend of the raw distribution. Sampling and the recorded
+    trace stay ordinary; only the embedding fed back changes. The other `swir_*`
+    fields do nothing unless this is set."""
+    swir_alpha: float = 1.0
+    """Blend floor toward `<think>` when a row switches back to soft; ramps to 1
+    over the generation."""
+    swir_beta: float = 0.7
+    """Blend floor toward `</think>` when a row switches to normal; ramps to 1
+    over the generation."""
+    swir_window: int = 512
+    """Steps a row must stay in normal mode before it may switch back to soft."""
+    swir_max_switch_count: int | None = None
+    """Soft->normal switches before convergence is forced: after this many the row
+    is fed the convergence tokens, after twice this many the termination tokens and
+    a cutoff `swir_termination_max_tokens` later. None disables forcing."""
+    swir_termination_max_tokens: int = 32
+    """Tokens allowed after the termination phrase before the row is cut off."""
+    swir_math_token_ids: list[int] | None = None
+    """Token ids fed back discretely even in soft mode -- math notation drifts
+    badly when consumed as a mixture. Tokenizer-dependent, so the caller supplies
+    them."""
+    swir_convergence_token_ids: list[int] | None = None
+    """Tokenization of the convergence phrase (typically `</think>`)."""
+    swir_termination_token_ids: list[int] | None = None
+    """Tokenization of the termination phrase."""
+    swir_linebreak_token_id: int | None = None
+    """The line-break token blended into the very first soft step, as the
+    reference implementation does."""
+    # end of swir
+    # begin of selar
+    selar: bool = False
+    """SeLaR (the selar method): gate each step on the entropy of the renormalised
+    top-`selar_topk` head of the sampling distribution; gated steps feed back the
+    head's embedding mixture displaced away from the top-1 embedding instead of the
+    sampled token's embedding. Sampling and the recorded trace stay ordinary. The
+    other `selar_*` fields do nothing unless this is set."""
+    selar_topk: int = 5
+    """Head size for the gate's entropy and the latent mixture."""
+    selar_entropy_threshold: float = 0.3
+    """Normalised-entropy threshold in [0, 1] above which a step feeds back the
+    latent input."""
+    selar_contrastive_weight: float = 1.0
+    """Scale of the contrastive displacement away from the top-1 embedding;
+    multiplied by the gate signal, so more uncertain steps are pushed harder."""
+    selar_math_token_ids: list[int] | None = None
+    """Token ids fed back discretely even when the gate is open. Tokenizer-
+    dependent, so the caller supplies them."""
+    # end of selar
     seed: int | None = None
     """Random seed to use for the generation."""
     stop: str | list[str] | None = None
@@ -408,6 +460,21 @@ class SamplingParams(
         soft_topk: int = 10,
         soft_entropy_threshold: float = 0.01,
         soft_patience: int = 256,
+        swir: bool = False,
+        swir_alpha: float = 1.0,
+        swir_beta: float = 0.7,
+        swir_window: int = 512,
+        swir_max_switch_count: int | None = None,
+        swir_termination_max_tokens: int = 32,
+        swir_math_token_ids: list[int] | None = None,
+        swir_convergence_token_ids: list[int] | None = None,
+        swir_termination_token_ids: list[int] | None = None,
+        swir_linebreak_token_id: int | None = None,
+        selar: bool = False,
+        selar_topk: int = 5,
+        selar_entropy_threshold: float = 0.3,
+        selar_contrastive_weight: float = 1.0,
+        selar_math_token_ids: list[int] | None = None,
         seed: int | None = None,
         stop: str | list[str] | None = None,
         stop_token_ids: list[int] | None = None,
@@ -475,6 +542,21 @@ class SamplingParams(
             soft_topk=soft_topk,
             soft_entropy_threshold=soft_entropy_threshold,
             soft_patience=soft_patience,
+            swir=swir,
+            swir_alpha=swir_alpha,
+            swir_beta=swir_beta,
+            swir_window=swir_window,
+            swir_max_switch_count=swir_max_switch_count,
+            swir_termination_max_tokens=swir_termination_max_tokens,
+            swir_math_token_ids=swir_math_token_ids,
+            swir_convergence_token_ids=swir_convergence_token_ids,
+            swir_termination_token_ids=swir_termination_token_ids,
+            swir_linebreak_token_id=swir_linebreak_token_id,
+            selar=selar,
+            selar_topk=selar_topk,
+            selar_entropy_threshold=selar_entropy_threshold,
+            selar_contrastive_weight=selar_contrastive_weight,
+            selar_math_token_ids=selar_math_token_ids,
             seed=seed,
             stop=stop,
             stop_token_ids=stop_token_ids,
@@ -606,6 +688,85 @@ class SamplingParams(
                     value=self.stop,
                 )
         # end of soft thinking
+        # begin of swir
+        if self.swir:
+            if self.soft_thinking:
+                raise VLLMValidationError(
+                    "swir and soft_thinking are mutually exclusive: each "
+                    "prescribes its own feedback embedding for every step.",
+                    parameter="swir",
+                    value=True,
+                )
+            if self.n != 1:
+                raise VLLMValidationError(
+                    f"swir supports n=1 only, got n={self.n}.",
+                    parameter="n",
+                    value=self.n,
+                )
+            if self.swir_window < 1:
+                raise VLLMValidationError(
+                    f"swir_window must be at least 1, got {self.swir_window}.",
+                    parameter="swir_window",
+                    value=self.swir_window,
+                )
+            if (self.swir_max_switch_count is not None
+                    and self.swir_max_switch_count < 1):
+                raise VLLMValidationError(
+                    "swir_max_switch_count must be at least 1 when set, got "
+                    f"{self.swir_max_switch_count}.",
+                    parameter="swir_max_switch_count",
+                    value=self.swir_max_switch_count,
+                )
+            if self.swir_max_switch_count is not None and not (
+                self.swir_convergence_token_ids
+                and self.swir_termination_token_ids
+            ):
+                raise VLLMValidationError(
+                    "swir_max_switch_count needs swir_convergence_token_ids "
+                    "and swir_termination_token_ids: they are what gets "
+                    "injected when the switch budget runs out.",
+                    parameter="swir_max_switch_count",
+                    value=self.swir_max_switch_count,
+                )
+            if self.swir_linebreak_token_id is None:
+                raise VLLMValidationError(
+                    "swir requires swir_linebreak_token_id: the very first "
+                    "soft step blends the mixture with the line-break "
+                    "embedding, and the id is tokenizer-dependent.",
+                    parameter="swir_linebreak_token_id",
+                    value=None,
+                )
+        # end of swir
+        # begin of selar
+        if self.selar:
+            if self.soft_thinking or self.swir:
+                raise VLLMValidationError(
+                    "selar, swir and soft_thinking are mutually exclusive: "
+                    "each prescribes its own feedback embedding for every step.",
+                    parameter="selar",
+                    value=True,
+                )
+            if self.n != 1:
+                raise VLLMValidationError(
+                    f"selar supports n=1 only, got n={self.n}.",
+                    parameter="n",
+                    value=self.n,
+                )
+            if self.selar_topk < 2:
+                raise VLLMValidationError(
+                    "selar_topk must be at least 2: the gate's entropy ceiling "
+                    f"is log(k), which is zero for k=1. Got {self.selar_topk}.",
+                    parameter="selar_topk",
+                    value=self.selar_topk,
+                )
+            if not 0.0 <= self.selar_entropy_threshold <= 1.0:
+                raise VLLMValidationError(
+                    "selar_entropy_threshold is a normalised entropy in "
+                    f"[0, 1], got {self.selar_entropy_threshold}.",
+                    parameter="selar_entropy_threshold",
+                    value=self.selar_entropy_threshold,
+                )
+        # end of selar
         if not -2.0 <= self.presence_penalty <= 2.0:
             raise VLLMValidationError(
                 f"presence_penalty must be in [-2, 2], got {self.presence_penalty}."
@@ -1216,6 +1377,14 @@ class SamplingParams(
             f"soft_topk={self.soft_topk}, "
             f"soft_entropy_threshold={self.soft_entropy_threshold}, "
             f"soft_patience={self.soft_patience}, "
+            f"swir={self.swir}, "
+            f"swir_alpha={self.swir_alpha}, "
+            f"swir_beta={self.swir_beta}, "
+            f"swir_window={self.swir_window}, "
+            f"swir_max_switch_count={self.swir_max_switch_count}, "
+            f"selar={self.selar}, "
+            f"selar_topk={self.selar_topk}, "
+            f"selar_entropy_threshold={self.selar_entropy_threshold}, "
             f"seed={self.seed}, "
             f"stop={self.stop}, "
             f"stop_token_ids={self.stop_token_ids}, "

@@ -186,6 +186,80 @@ class InputProcessor:
                     "concept token is produced on the last PP rank and consumed "
                     "by the embedding layer on the first."
                 )
+            # begin of swir engine refusals
+            if params.swir:
+                if self.vllm_config.use_v2_model_runner:
+                    raise VLLMValidationError(
+                        "swir is implemented in the V1 GPU model runner only, "
+                        "and this engine selected the V2 runner. Set "
+                        "VLLM_USE_V2_MODEL_RUNNER=0 before building the engine."
+                    )
+                rc = self.vllm_config.reasoning_config
+                if rc is None or not rc.enabled or not rc.reasoning_start_token_ids:
+                    raise VLLMValidationError(
+                        "swir is set but reasoning_config is not configured. "
+                        "Please set --reasoning-parser so the thinking block's "
+                        "start and end tokens are known: they anchor the "
+                        "switch blends and the forced convergence."
+                    )
+                if not self.vllm_config.model_config.enable_prompt_embeds:
+                    raise VLLMValidationError(
+                        "swir requires --enable-prompt-embeds: soft steps feed "
+                        "back a mixture through inputs_embeds, which the plain "
+                        "token-id path does not build."
+                    )
+                if self.cache_config.enable_prefix_caching:
+                    raise VLLMValidationError(
+                        "swir requires --no-enable-prefix-caching: the prefix "
+                        "cache is keyed by token ids, and a soft step's KV "
+                        "does not correspond to the id recorded for it."
+                    )
+                if self.speculative_config is not None:
+                    raise VLLMValidationError(
+                        "swir does not support speculative decoding: a draft "
+                        "is proposed from token ids, and a soft step feeds "
+                        "back a mixture that has none."
+                    )
+                if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+                    raise VLLMValidationError(
+                        "swir does not support pipeline parallelism: the "
+                        "mixture is produced on the last PP rank and consumed "
+                        "by the embedding layer on the first."
+                    )
+            # end of swir engine refusals
+            # begin of selar engine refusals
+            if params.selar:
+                if self.vllm_config.use_v2_model_runner:
+                    raise VLLMValidationError(
+                        "selar is implemented in the V1 GPU model runner only, "
+                        "and this engine selected the V2 runner. Set "
+                        "VLLM_USE_V2_MODEL_RUNNER=0 before building the engine."
+                    )
+                if not self.vllm_config.model_config.enable_prompt_embeds:
+                    raise VLLMValidationError(
+                        "selar requires --enable-prompt-embeds: gated steps "
+                        "feed back a latent input through inputs_embeds, which "
+                        "the plain token-id path does not build."
+                    )
+                if self.cache_config.enable_prefix_caching:
+                    raise VLLMValidationError(
+                        "selar requires --no-enable-prefix-caching: the prefix "
+                        "cache is keyed by token ids, and a latent step's KV "
+                        "does not correspond to the id recorded for it."
+                    )
+                if self.speculative_config is not None:
+                    raise VLLMValidationError(
+                        "selar does not support speculative decoding: a draft "
+                        "is proposed from token ids, and a gated step feeds "
+                        "back a latent input that has none."
+                    )
+                if self.vllm_config.parallel_config.pipeline_parallel_size > 1:
+                    raise VLLMValidationError(
+                        "selar does not support pipeline parallelism: the "
+                        "latent input is produced on the last PP rank and "
+                        "consumed by the embedding layer on the first."
+                    )
+            # end of selar engine refusals
             if params.soft_thinking and self.speculative_config is not None:
                 # A draft is proposed from token ids, but a thinking row's next
                 # input is a mixture with no id, so the draft and the target

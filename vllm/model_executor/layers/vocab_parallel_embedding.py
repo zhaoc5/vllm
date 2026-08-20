@@ -563,6 +563,38 @@ class VocabParallelEmbedding(PluggableLayer):
             return tensor_model_parallel_all_reduce(mixture)
         return mixture
 
+    def dense_weighted_forward(self, weights: torch.Tensor) -> torch.Tensor:
+        """Embed a full-vocabulary mixture: ``sum_v weights[:, v] * E[v]``.
+
+        SwiReasoning's soft steps feed back the probability-weighted mixture
+        of *every* token embedding, not a top-k. Under tensor parallelism each
+        rank multiplies its own vocabulary shard's slice of the weights with
+        its shard of the table and the all-reduce completes the sum; only the
+        reduction order differs from the single-rank result.
+
+        Args:
+            weights: ``[num_tokens, num_org_embeddings]`` fp32 weights over
+                the unpadded original vocabulary (the logits vocabulary).
+
+        Returns:
+            ``[num_tokens, hidden_size]``, in this layer's dtype.
+        """
+        if not hasattr(self, "weight"):
+            raise RuntimeError(
+                "dense_weighted_forward needs the unquantized embedding "
+                "table; this layer's quant method does not expose one."
+            )
+        start = self.shard_indices.org_vocab_start_index
+        end = self.shard_indices.org_vocab_end_index
+        shard = self.weight[: end - start]
+        # fp32 accumulate: a vocab-wide sum of tiny products loses badly in
+        # bf16. Cast back before the collective so it runs in forward's dtype.
+        mixture = torch.matmul(weights[:, start:end], shard.float())
+        mixture = mixture.to(shard.dtype)
+        if self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(mixture)
+        return mixture
+
     # end of soft thinking
 
     def extra_repr(self) -> str:

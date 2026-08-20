@@ -2103,7 +2103,123 @@ class GPUModelRunner(
         self._st_embed_layer = layer
         return layer
 
-    # end of soft thinking
+    # begin of swir
+    def _apply_swir_embeds(self, num_scheduled_tokens: int) -> None:
+        """Replace swir rows' token embeddings with their directive embeddings.
+
+        A row in soft mode feeds back the full-vocabulary mixture of token
+        embeddings the sampler stored last step, optionally eased toward an
+        anchor embedding on switch steps: ``w * mixture + (1 - w) * E[anchor]``.
+        Rows in normal mode carry no directive and keep the ordinary token-id
+        path. Position math and validity follow ``_apply_soft_thinking_embeds``:
+        only rows scheduled exactly one token this step are decoding.
+        """
+        self._swir_wrote_embeds = False
+        holder = getattr(self.input_batch, "swi_reasoning_state_holder", None)
+        if holder is None:
+            return
+        num_reqs = self.input_batch.num_reqs
+        holder.set_rows_without_a_real_decode(
+            np.nonzero(self.discard_request_mask.np[:num_reqs])[0].tolist()
+        )
+        handoff = holder.embed_directives()
+        if handoff is None:
+            return
+        rows, probs, blend_ids, blend_ws = handoff
+
+        row_np = rows.cpu().numpy()
+        starts = self.query_start_loc.np[row_np]
+        positions_np = self.query_start_loc.np[row_np + 1] - 1
+        valid = (positions_np < num_scheduled_tokens) & (positions_np == starts)
+        if not valid.all():
+            keep = torch.as_tensor(valid, device=probs.device)
+            positions_np = positions_np[valid]
+            probs, blend_ids, blend_ws = probs[keep], blend_ids[keep], blend_ws[keep]
+            if positions_np.size == 0:
+                return
+
+        embed_layer = self._soft_thinking_embed_layer()
+        if embed_layer is None:
+            return
+        mixture = embed_layer.dense_weighted_forward(probs).to(torch.float32)
+
+        blended = blend_ids >= 0
+        if bool(blended.any()):
+            anchors = embed_layer.weighted_forward(
+                blend_ids.clamp(min=0).unsqueeze(-1),
+                torch.ones_like(blend_ws).unsqueeze(-1),
+            ).to(torch.float32)
+            w = blend_ws.unsqueeze(-1)
+            eased = w * mixture + (1.0 - w) * anchors
+            mixture = torch.where(blended.unsqueeze(-1), eased, mixture)
+
+        positions = torch.as_tensor(
+            positions_np, device=self.inputs_embeds.gpu.device, dtype=torch.long
+        )
+        self.inputs_embeds.gpu[positions] = mixture.to(self.inputs_embeds.gpu.dtype)
+        self.is_token_ids.np[positions_np] = False
+        self.is_token_ids.copy_to_gpu(num_scheduled_tokens)
+        self._swir_wrote_embeds = True
+
+    # end of swir
+
+    # begin of selar
+    def _apply_selar_embeds(self, num_scheduled_tokens: int) -> None:
+        """Replace gated selar rows' token embeddings with the latent input.
+
+        The latent input is the probability-weighted mixture of the top-k
+        embeddings, displaced away from the most probable token's embedding
+        along its own offset, scaled by the contrastive push the sampler
+        stored last step. Ungated rows carry no directive and keep the
+        ordinary token-id path. Position math and validity follow
+        ``_apply_soft_thinking_embeds``.
+        """
+        self._selar_wrote_embeds = False
+        holder = getattr(self.input_batch, "selar_state_holder", None)
+        if holder is None:
+            return
+        num_reqs = self.input_batch.num_reqs
+        holder.set_rows_without_a_real_decode(
+            np.nonzero(self.discard_request_mask.np[:num_reqs])[0].tolist()
+        )
+        handoff = holder.embed_directives()
+        if handoff is None:
+            return
+        rows, head_ids, head_weights, pushes = handoff
+
+        row_np = rows.cpu().numpy()
+        starts = self.query_start_loc.np[row_np]
+        positions_np = self.query_start_loc.np[row_np + 1] - 1
+        valid = (positions_np < num_scheduled_tokens) & (positions_np == starts)
+        if not valid.all():
+            keep = torch.as_tensor(valid, device=head_ids.device)
+            positions_np = positions_np[valid]
+            head_ids, head_weights = head_ids[keep], head_weights[keep]
+            pushes = pushes[keep]
+            if positions_np.size == 0:
+                return
+
+        embed_layer = self._soft_thinking_embed_layer()
+        if embed_layer is None:
+            return
+        mixture = embed_layer.weighted_forward(
+            head_ids, head_weights).to(torch.float32)
+        anchor = embed_layer.weighted_forward(
+            head_ids[:, :1], torch.ones_like(head_weights[:, :1])
+        ).to(torch.float32)
+        offset = mixture - anchor
+        offset_norm = torch.norm(offset, dim=-1, keepdim=True) + 1e-10
+        latent = mixture + pushes.unsqueeze(-1) * (offset / offset_norm) * offset_norm
+
+        positions = torch.as_tensor(
+            positions_np, device=self.inputs_embeds.gpu.device, dtype=torch.long
+        )
+        self.inputs_embeds.gpu[positions] = latent.to(self.inputs_embeds.gpu.dtype)
+        self.is_token_ids.np[positions_np] = False
+        self.is_token_ids.copy_to_gpu(num_scheduled_tokens)
+        self._selar_wrote_embeds = True
+
+    # end of selar
 
     def _prepare_inputs(
         self,
@@ -3731,6 +3847,12 @@ class GPUModelRunner(
         # order this reads.
         self._apply_soft_thinking_embeds(num_scheduled_tokens)
         # end of soft thinking
+        # begin of swir
+        self._apply_swir_embeds(num_scheduled_tokens)
+        # end of swir
+        # begin of selar
+        self._apply_selar_embeds(num_scheduled_tokens)
+        # end of selar
 
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
@@ -3752,8 +3874,11 @@ class GPUModelRunner(
             # would erase concept tokens; this masked path is what leaves
             # non-token-id positions alone.
             if (
-                self.enable_prompt_embeds and self.input_batch.req_prompt_embeds
-            ) or getattr(self, "_soft_thinking_wrote_embeds", False):
+                (self.enable_prompt_embeds and self.input_batch.req_prompt_embeds)
+                or getattr(self, "_soft_thinking_wrote_embeds", False)
+                or getattr(self, "_swir_wrote_embeds", False)
+                or getattr(self, "_selar_wrote_embeds", False)
+            ):
                 # Some positions carry precomputed prompt_embeds: they are
                 # already in self.inputs_embeds and marked is_token_ids=False.
                 # Embed only the token-id positions (zeroing the placeholder ids

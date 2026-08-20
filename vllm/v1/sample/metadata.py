@@ -9,6 +9,8 @@ import torch
 
 from vllm.v1.sample.logits_processor import LogitsProcessors
 from vllm.v1.sample.soft_thinking_state import SoftThinkingStateHolder
+from vllm.v1.sample.selar_state import SelarStateHolder
+from vllm.v1.sample.swi_reasoning_state import SwiReasoningStateHolder
 from vllm.v1.sample.thinking_budget_state import ThinkingBudgetStateHolder
 
 
@@ -57,3 +59,7 @@ class SamplingMetadata:
     # Soft Thinking: tracks which rows are still inside their thinking block and
     # carries their concept tokens to the next step.
     soft_thinking_state_holder: SoftThinkingStateHolder | None = None
+    # SwiReasoning: per-row soft/discrete mode machine and next-input directives.
+    swi_reasoning_state_holder: SwiReasoningStateHolder | None = None
+    # SeLaR: per-step entropy gate and latent-input directives.
+    selar_state_holder: SelarStateHolder | None = None

@@ -93,6 +93,15 @@ class Sampler(nn.Module):
                 else:
                     raw_logprobs = logits.to(torch.float32)
 
+        # begin of swir
+        # SwiReasoning reads its entropy signal and mixture from the raw
+        # distribution -- before penalties and temperature -- and the
+        # processors below may mutate `logits` in place, so capture first.
+        swir_holder = sampling_metadata.swi_reasoning_state_holder
+        if swir_holder is not None and swir_holder.has_tracked_requests():
+            swir_holder.observe_logits(logits)
+        # end of swir
+
         # Use float32 for the logits.
         logits = logits.to(torch.float32)
 
@@ -109,6 +118,15 @@ class Sampler(nn.Module):
         if soft_holder is not None and soft_holder.has_tracked_requests():
             soft_forced_ids = soft_holder.step_from_metadata(logits, sampling_metadata)
         # end of soft thinking
+
+        # begin of selar
+        # Same hook point as Soft Thinking: the gate reads the sampling
+        # distribution, recomputed from these post-penalty logits before
+        # apply_temperature divides them in place.
+        selar_holder = sampling_metadata.selar_state_holder
+        if selar_holder is not None and selar_holder.has_tracked_requests():
+            selar_holder.prepare(logits, sampling_metadata)
+        # end of selar
 
         # Sample the next token.
         sampled, processed_logprobs = self.sample(logits, sampling_metadata)
@@ -127,6 +145,25 @@ class Sampler(nn.Module):
         if soft_forced_ids is not None and soft_forced_ids.shape == sampled.shape:
             sampled = torch.where(soft_forced_ids >= 0, soft_forced_ids, sampled)
         # end of soft thinking
+
+        # begin of swir
+        # The mode machine advances on the sampled token; convergence and
+        # termination injections override it. Same shape guard as above.
+        if swir_holder is not None and swir_holder.has_tracked_requests():
+            swir_forced_ids = swir_holder.step(sampled)
+            if (swir_forced_ids is not None
+                    and swir_forced_ids.shape == sampled.shape):
+                sampled = torch.where(
+                    swir_forced_ids >= 0, swir_forced_ids, sampled
+                )
+        # end of swir
+
+        # begin of selar
+        # Math-token steps stay discrete; the check needs the sampled token,
+        # which only exists now.
+        if selar_holder is not None and selar_holder.has_tracked_requests():
+            selar_holder.finalize(sampled)
+        # end of selar
 
         # Handle logprob_token_ids if specified (more efficient than full vocab)
         # This is used by generative_scoring API to get logprobs for specific tokens

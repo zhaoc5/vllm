@@ -27,6 +27,10 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.soft_thinking_state import (
     maybe_create_soft_thinking_state_holder,
 )
+from vllm.v1.sample.selar_state import maybe_create_selar_state_holder
+from vllm.v1.sample.swi_reasoning_state import (
+    maybe_create_swi_reasoning_state_holder,
+)
 from vllm.v1.sample.thinking_budget_state import (
     maybe_create_thinking_budget_state_holder,
 )
@@ -121,6 +125,15 @@ class InputBatch:
         )
         self.soft_thinking_state_holder = maybe_create_soft_thinking_state_holder(
             reasoning_config,
+            max_num_reqs,
+            device,
+        )
+        self.swi_reasoning_state_holder = maybe_create_swi_reasoning_state_holder(
+            reasoning_config,
+            max_num_reqs,
+            device,
+        )
+        self.selar_state_holder = maybe_create_selar_state_holder(
             max_num_reqs,
             device,
         )
@@ -862,6 +875,10 @@ class InputBatch:
             self.thinking_budget_state_holder.sync_batch(batch_update)
         if self.soft_thinking_state_holder is not None and batch_update:
             self.soft_thinking_state_holder.sync_batch(batch_update)
+        if self.swi_reasoning_state_holder is not None and batch_update:
+            self.swi_reasoning_state_holder.sync_batch(batch_update)
+        if self.selar_state_holder is not None and batch_update:
+            self.selar_state_holder.sync_batch(batch_update)
         for logit_proc in self.logitsprocs.all:
             logit_proc.update_state(batch_update)
         if batch_update:
@@ -971,6 +988,8 @@ class InputBatch:
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
             soft_thinking_state_holder=self.soft_thinking_state_holder,
+            swi_reasoning_state_holder=self.swi_reasoning_state_holder,
+            selar_state_holder=self.selar_state_holder,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:
